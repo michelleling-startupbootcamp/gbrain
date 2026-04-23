@@ -30,19 +30,6 @@ function validateParams(op: Operation, params: Record<string, unknown>): string 
   return null;
 }
 
-/** Read and parse the JSON body from a Node.js IncomingMessage */
-function readBody(req: IncomingMessage): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    let raw = '';
-    req.on('data', (chunk: Buffer) => { raw += chunk.toString(); });
-    req.on('end', () => {
-      try { resolve(raw ? JSON.parse(raw) : undefined); }
-      catch { resolve(undefined); }
-    });
-    req.on('error', reject);
-  });
-}
-
 /** Create and configure a new MCP Server instance wrapping the given engine */
 function createMcpServer(engine: BrainEngine): Server {
   const server = new Server(
@@ -102,28 +89,38 @@ export async function startMcpServer(engine: BrainEngine) {
     console.error(`Starting GBrain MCP server (HTTP) on port ${port}...`);
 
     const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
-      const url = new URL(req.url || '/', `http://localhost:${port}`);
+      try {
+        const url = new URL(req.url || '/', `http://localhost:${port}`);
 
-      // Health check
-      if (url.pathname === '/' || url.pathname === '/health') {
-        const body = JSON.stringify({ status: 'ok', service: 'gbrain', version: VERSION });
-        res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
-        res.end(body);
-        return;
+        // Health check
+        if (url.pathname === '/' || url.pathname === '/health') {
+          const body = JSON.stringify({ status: 'ok', service: 'gbrain', version: VERSION });
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(body);
+          return;
+        }
+
+        // MCP endpoint — new Server + transport per request (stateless)
+        // Do NOT pre-read req body — let transport consume the stream directly
+        if (url.pathname === '/mcp') {
+          const server = createMcpServer(engine);
+          const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: undefined,
+          });
+          await server.connect(transport);
+          await transport.handleRequest(req, res);
+          return;
+        }
+
+        res.writeHead(404);
+        res.end('Not found');
+      } catch (err) {
+        console.error('[gbrain] Unhandled request error:', err);
+        if (!res.headersSent) {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: String(err) }));
+        }
       }
-
-      // MCP endpoint — stateless: new Server + transport per request
-      if (url.pathname === '/mcp') {
-        const parsedBody = await readBody(req);
-        const server = createMcpServer(engine);
-        const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-        await server.connect(transport);
-        await transport.handleRequest(req, res, parsedBody);
-        return;
-      }
-
-      res.writeHead(404);
-      res.end('Not found');
     });
 
     httpServer.listen(port, () => {
