@@ -1,5 +1,6 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError } from '../core/operations.ts';
@@ -27,20 +28,17 @@ function validateParams(op: Operation, params: Record<string, unknown>): string 
   return null;
 }
 
-export async function startMcpServer(engine: BrainEngine) {
+/** Create and configure a new MCP Server instance */
+function createServer(engine: BrainEngine): Server {
   const server = new Server(
     { name: 'gbrain', version: VERSION },
     { capabilities: { tools: {} } },
   );
 
-  // Generate tool definitions from operations. Extracted to buildToolDefs so
-  // the subagent tool registry (v0.15+) can call the same mapper against a
-  // filtered OPERATIONS subset instead of duplicating this shape.
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: buildToolDefs(operations),
   }));
 
-  // Dispatch tool calls to operation handlers
   server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
     const { name, arguments: params } = request.params;
     const op = operations.find(o => o.name === name);
@@ -57,7 +55,7 @@ export async function startMcpServer(engine: BrainEngine) {
         error: (msg: string) => process.stderr.write(`[error] ${msg}\n`),
       },
       dryRun: !!(params?.dry_run),
-      // MCP stdio callers are remote/untrusted; enforce strict file confinement.
+      // MCP callers are remote/untrusted; enforce strict file confinement.
       remote: true,
     };
 
@@ -79,8 +77,52 @@ export async function startMcpServer(engine: BrainEngine) {
     }
   });
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  return server;
+}
+
+export async function startMcpServer(engine: BrainEngine) {
+  const port = parseInt(process.env.PORT || '0', 10);
+
+  if (port > 0) {
+    // HTTP transport mode — used when deployed on Railway (PORT is injected automatically)
+    console.error(`Starting GBrain MCP server (HTTP) on port ${port}...`);
+
+    Bun.serve({
+      port,
+      async fetch(req: Request): Promise<Response> {
+        const url = new URL(req.url);
+
+        // Health check endpoint
+        if (url.pathname === '/' || url.pathname === '/health') {
+          return new Response(
+            JSON.stringify({ status: 'ok', service: 'gbrain', version: VERSION }),
+            { headers: { 'content-type': 'application/json' } },
+          );
+        }
+
+        // MCP endpoint — stateless: each request gets its own Server + transport
+        if (url.pathname === '/mcp') {
+          const server = createServer(engine);
+          const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: undefined, // stateless mode
+          });
+          await server.connect(transport);
+          return await transport.handleRequest(req);
+        }
+
+        return new Response('Not found', { status: 404 });
+      },
+    });
+
+    // Keep process alive indefinitely
+    await new Promise<never>(() => {});
+  } else {
+    // Stdio transport mode — used by local MCP clients (Hermes, Claude Desktop)
+    console.error('Starting GBrain MCP server (stdio)...');
+    const server = createServer(engine);
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+  }
 }
 
 // Backward compat: used by `gbrain call` command
