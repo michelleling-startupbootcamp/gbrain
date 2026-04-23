@@ -2,15 +2,15 @@
  * Embedding Service
  * Ported from production Ruby implementation (embedding_service.rb, 190 LOC)
  *
- * OpenAI text-embedding-3-large at 1536 dimensions.
+ * Jina jina-embeddings-v3 at 1024 dimensions.
  * Retry with exponential backoff (4s base, 120s cap, 5 retries).
  * 8000 character input truncation.
  */
 
 import OpenAI from 'openai';
 
-const MODEL = 'text-embedding-3-large';
-const DIMENSIONS = 1536;
+const MODEL = process.env.EMBEDDING_MODEL || 'jina-embeddings-v3';
+const DIMENSIONS = parseInt(process.env.EMBEDDING_DIMENSIONS || '1024', 10);
 const MAX_CHARS = 8000;
 const MAX_RETRIES = 5;
 const BASE_DELAY_MS = 4000;
@@ -21,7 +21,7 @@ let client: OpenAI | null = null;
 
 function getClient(): OpenAI {
   if (!client) {
-    client = new OpenAI();
+    client = new OpenAI({ baseURL: process.env.OPENAI_BASE_URL });
   }
   return client;
 }
